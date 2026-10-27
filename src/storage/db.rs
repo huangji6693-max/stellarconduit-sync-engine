@@ -196,6 +196,8 @@ struct ConflictRow {
     envelope_b: Vec<u8>,
     detected_at: i64,
     resolved: i64,
+    #[serde(default)]
+    resolution: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -290,7 +292,8 @@ impl SyncEngineDb {
                     envelope_a      BLOB NOT NULL,
                     envelope_b      BLOB NOT NULL,
                     detected_at     INTEGER NOT NULL,
-                    resolved        INTEGER NOT NULL DEFAULT 0
+                    resolved        INTEGER NOT NULL DEFAULT 0,
+                    resolution      TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS settlement_history (
@@ -959,6 +962,95 @@ impl SyncEngineDb {
         Ok(())
     }
 
+    /// Mark the conflict with row id `conflict_id` as resolved (`resolved = 1`)
+    /// and record the human-readable `resolution` outcome (e.g.
+    /// `"envelope_a_won_by_timestamp"`, `"escalated_resolved_on_chain"`),
+    /// excluding it from future [`Self::list_unresolved_conflicts`] queries.
+    pub async fn mark_conflict_resolved(
+        &self,
+        conflict_id: i64,
+        resolution: &str,
+    ) -> Result<(), SyncEngineError> {
+        let resolution = resolution.to_string();
+        self.conn
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE conflicts SET resolved = 1, resolution = ?1 WHERE id = ?2",
+                    rusqlite::params![resolution, conflict_id],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Garbage-collect resolved conflicts (`resolved = 1`) whose `detected_at`
+    /// timestamp is strictly older than `now.saturating_sub(max_age_secs)`.
+    ///
+    /// # Retention Policy Rationale (Issue #21)
+    ///
+    /// - **Unresolved conflicts (`resolved = 0`) are NEVER pruned**, regardless of
+    ///   their age: an unresolved double-spend conflict represents an active
+    ///   competing sequence claim that has not yet been adjudicated off-chain or
+    ///   on-chain, and deleting it would lose audit/dispute evidence.
+    /// - **Resolved conflicts (`resolved = 1`)** are retained for `max_age_secs`
+    ///   (e.g. 30 days in production) so recent post-mortem debugging and user
+    ///   history views remain intact, after which rows with
+    ///   `detected_at < now.saturating_sub(max_age_secs)` are deleted to prevent
+    ///   unbounded SQLite growth on long-lived devices.
+    ///
+    /// Returns the number of conflict rows deleted.
+    pub async fn prune_resolved_conflicts(
+        &self,
+        max_age_secs: u64,
+        now: u64,
+    ) -> Result<usize, SyncEngineError> {
+        let cutoff = now.saturating_sub(max_age_secs) as i64;
+        let deleted = self
+            .conn
+            .call(move |conn| {
+                let count = conn.execute(
+                    "DELETE FROM conflicts WHERE resolved = 1 AND detected_at < ?1",
+                    rusqlite::params![cutoff],
+                )?;
+                Ok(count)
+            })
+            .await?;
+        Ok(deleted)
+    }
+
+    /// Garbage-collect submitted dispute escalations (`submitted = 1`) whose
+    /// `created_at` timestamp is strictly older than `now.saturating_sub(max_age_secs)`.
+    ///
+    /// # Retention Policy Rationale (Issue #21)
+    ///
+    /// - **Pending escalations (`submitted = 0`) are NEVER pruned**, regardless
+    ///   of age: they still await relay pickup and submission to the on-chain
+    ///   `dispute-resolver` contract.
+    /// - **Submitted escalations (`submitted = 1`)** are retained for a
+    ///   configurable window (`max_age_secs`) for auditability and then removed
+    ///   once `created_at < now.saturating_sub(max_age_secs)`.
+    ///
+    /// Returns the number of escalation rows deleted.
+    pub async fn prune_submitted_escalations(
+        &self,
+        max_age_secs: u64,
+        now: u64,
+    ) -> Result<usize, SyncEngineError> {
+        let cutoff = now.saturating_sub(max_age_secs) as i64;
+        let deleted = self
+            .conn
+            .call(move |conn| {
+                let count = conn.execute(
+                    "DELETE FROM dispute_escalations WHERE submitted = 1 AND created_at < ?1",
+                    rusqlite::params![cutoff],
+                )?;
+                Ok(count)
+            })
+            .await?;
+        Ok(deleted)
+    }
+
     pub async fn list_unresolved_conflicts(&self) -> Result<Vec<Conflict>, SyncEngineError> {
         let rows = self
             .conn
@@ -1360,7 +1452,7 @@ impl SyncEngineDb {
                     .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
                 let mut stmt = conn.prepare(
-                    "SELECT id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved
+                    "SELECT id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved, resolution
                      FROM conflicts",
                 )?;
                 let conflicts = stmt
@@ -1373,6 +1465,7 @@ impl SyncEngineDb {
                             envelope_b: row.get(4)?,
                             detected_at: row.get(5)?,
                             resolved: row.get(6)?,
+                            resolution: row.get(7)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, rusqlite::Error>>()?;
@@ -1543,8 +1636,8 @@ impl SyncEngineDb {
                 for row in &snapshot.conflicts {
                     tx.execute(
                         "INSERT INTO conflicts
-                            (id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            (id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved, resolution)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         rusqlite::params![
                             row.id,
                             row.source_account,
@@ -1552,7 +1645,8 @@ impl SyncEngineDb {
                             row.envelope_a,
                             row.envelope_b,
                             row.detected_at,
-                            row.resolved
+                            row.resolved,
+                            row.resolution
                         ],
                     )?;
                 }
@@ -2447,5 +2541,157 @@ mod tests {
             result.is_err() || result.unwrap().is_none(),
             "Expected error or None when reading encrypted DB without key"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mark_resolved_excludes_from_unresolved_list() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let c1 = Conflict {
+            source_account: "GCONF1".to_string(),
+            sequence: 10,
+            envelope_a: [1u8; 32],
+            envelope_b: [2u8; 32],
+        };
+        let c2 = Conflict {
+            source_account: "GCONF2".to_string(),
+            sequence: 20,
+            envelope_a: [3u8; 32],
+            envelope_b: [4u8; 32],
+        };
+
+        db.record_conflict(&c1, 1_000).await.unwrap();
+        db.record_conflict(&c2, 1_100).await.unwrap();
+
+        let all = db.list_all_conflicts().await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        db.mark_conflict_resolved(all[0].id, "envelope_a_won_by_timestamp")
+            .await
+            .unwrap();
+
+        let unresolved = db.list_unresolved_conflicts().await.unwrap();
+        assert_eq!(unresolved, vec![c2]);
+
+        let all_after = db.list_all_conflicts().await.unwrap();
+        assert!(all_after[0].resolved);
+        assert!(!all_after[1].resolved);
+    }
+
+    #[tokio::test]
+    async fn test_prune_never_removes_unresolved_conflicts() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let c_old_unresolved = Conflict {
+            source_account: "GUNRES_OLD".to_string(),
+            sequence: 1,
+            envelope_a: [11u8; 32],
+            envelope_b: [12u8; 32],
+        };
+        let c_ancient_unresolved = Conflict {
+            source_account: "GUNRES_ANCIENT".to_string(),
+            sequence: 2,
+            envelope_a: [13u8; 32],
+            envelope_b: [14u8; 32],
+        };
+
+        db.record_conflict(&c_old_unresolved, 100).await.unwrap();
+        db.record_conflict(&c_ancient_unresolved, 1).await.unwrap();
+
+        // Even with a tiny max_age_secs and a huge `now`, unresolved conflicts are never pruned.
+        let pruned = db
+            .prune_resolved_conflicts(60, 1_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 0);
+        assert_eq!(
+            db.list_unresolved_conflicts().await.unwrap(),
+            vec![c_old_unresolved, c_ancient_unresolved]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prune_removes_old_resolved_conflicts() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let c_old_resolved = Conflict {
+            source_account: "GOLD_RES".to_string(),
+            sequence: 10,
+            envelope_a: [21u8; 32],
+            envelope_b: [22u8; 32],
+        };
+        let c_unresolved = Conflict {
+            source_account: "GOLD_UNRES".to_string(),
+            sequence: 11,
+            envelope_a: [23u8; 32],
+            envelope_b: [24u8; 32],
+        };
+
+        db.record_conflict(&c_old_resolved, 1_000).await.unwrap();
+        db.record_conflict(&c_unresolved, 1_000).await.unwrap();
+
+        let all = db.list_all_conflicts().await.unwrap();
+        db.mark_conflict_resolved(all[0].id, "resolved_off_chain")
+            .await
+            .unwrap();
+
+        // Also verify submitted escalations older than cutoff are pruned while unsubmitted stay.
+        let env_a = escalation_input(c_old_resolved.envelope_a, [10u8; 32], 1_000);
+        let env_b = escalation_input(c_old_resolved.envelope_b, [20u8; 32], 2_000);
+        let esc = build_escalation(&c_old_resolved, &env_a, &env_b).unwrap();
+        let esc_submitted_id = db
+            .save_escalation(&c_old_resolved, &esc, 1_000)
+            .await
+            .unwrap();
+        let _esc_pending_id = db
+            .save_escalation(&c_unresolved, &esc, 1_000)
+            .await
+            .unwrap();
+        db.mark_escalation_submitted(esc_submitted_id)
+            .await
+            .unwrap();
+
+        let pruned_conflicts = db.prune_resolved_conflicts(500, 2_000).await.unwrap();
+        assert_eq!(pruned_conflicts, 1);
+
+        let pruned_escalations = db.prune_submitted_escalations(500, 2_000).await.unwrap();
+        assert_eq!(pruned_escalations, 1);
+
+        let remaining = db.list_all_conflicts().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].source_account, "GOLD_UNRES");
+        assert!(!remaining[0].resolved);
+        assert_eq!(db.list_pending_escalations().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_prune_leaves_recent_resolved_conflicts() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let c_recent = Conflict {
+            source_account: "GRECENT_RES".to_string(),
+            sequence: 50,
+            envelope_a: [31u8; 32],
+            envelope_b: [32u8; 32],
+        };
+        let c_boundary = Conflict {
+            source_account: "GBOUND_RES".to_string(),
+            sequence: 51,
+            envelope_a: [33u8; 32],
+            envelope_b: [34u8; 32],
+        };
+
+        db.record_conflict(&c_recent, 1_800).await.unwrap();
+        db.record_conflict(&c_boundary, 1_500).await.unwrap();
+
+        let all = db.list_all_conflicts().await.unwrap();
+        db.mark_conflict_resolved(all[0].id, "tiebreak")
+            .await
+            .unwrap();
+        db.mark_conflict_resolved(all[1].id, "tiebreak")
+            .await
+            .unwrap();
+
+        // At now = 2_000 with max_age_secs = 500, cutoff is 1_500 (`detected_at < 1_500`),
+        // so both 1_800 and 1_500 are retained.
+        let pruned = db.prune_resolved_conflicts(500, 2_000).await.unwrap();
+        assert_eq!(pruned, 0);
+        assert_eq!(db.list_all_conflicts().await.unwrap().len(), 2);
     }
 }
