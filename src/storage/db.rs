@@ -179,6 +179,10 @@ struct SettlementStatusRow {
     message_id: Vec<u8>,
     status: String,
     updated_at: i64,
+    #[serde(default)]
+    status_entered_at: i64,
+    #[serde(default)]
+    needs_reconciliation: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -273,9 +277,11 @@ impl SyncEngineDb {
                 );
 
                 CREATE TABLE IF NOT EXISTS settlement_status (
-                    message_id  BLOB PRIMARY KEY,
-                    status      TEXT NOT NULL,
-                    updated_at  INTEGER NOT NULL
+                    message_id           BLOB PRIMARY KEY,
+                    status               TEXT NOT NULL,
+                    updated_at           INTEGER NOT NULL,
+                    status_entered_at    INTEGER NOT NULL DEFAULT 0,
+                    needs_reconciliation INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS sequence_reservations (
@@ -583,9 +589,10 @@ impl SyncEngineDb {
                     ],
                 )?;
                 tx.execute(
-                    "INSERT OR REPLACE INTO settlement_status (message_id, status, updated_at)
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![message_id, status, enqueued_at as i64],
+                    "INSERT OR REPLACE INTO settlement_status
+                        (message_id, status, updated_at, status_entered_at, needs_reconciliation)
+                     VALUES (?1, ?2, ?3, ?4, 0)",
+                    rusqlite::params![message_id, status, enqueued_at as i64, enqueued_at as i64],
                 )?;
                 tx.commit()?;
                 Ok(())
@@ -713,20 +720,57 @@ impl SyncEngineDb {
     ) -> Result<(), SyncEngineError> {
         let id = message_id.to_vec();
         let status_str = status.as_str().to_string();
-        self.conn
+        let outcome: Result<(), SyncEngineError> = self
+            .conn
             .call(move |conn| {
-                let from_status: String = conn
-                    .query_row(
-                        "SELECT status FROM settlement_status WHERE message_id = ?1",
-                        rusqlite::params![id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or_default();
+                let existing: Option<(String, i64, i64)> = match conn.query_row(
+                    "SELECT status, status_entered_at, needs_reconciliation
+                     FROM settlement_status WHERE message_id = ?1",
+                    rusqlite::params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ) {
+                    Ok(row) => Some(row),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(e) => return Err(e.into()),
+                };
+
+                if let Some((ref from_status, _, needs_reconciliation)) = existing {
+                    if from_status == SettlementStatus::Failed.as_str()
+                        && needs_reconciliation != 0
+                        && status == SettlementStatus::Propagating
+                    {
+                        return Ok(Err(SyncEngineError::InvalidStateTransition {
+                            from: "failed (awaiting on-chain non-settlement confirmation)"
+                                .to_string(),
+                            to: status_str,
+                        }));
+                    }
+                }
+
+                let (from_status, status_entered_at, next_needs_reconciliation) = match existing {
+                    Some((prev_status, prev_entered_at, prev_needs_reconcil))
+                        if prev_status == status_str =>
+                    {
+                        // Touching `updated_at` without changing `status` must preserve
+                        // `status_entered_at` so stuck-propagating age sweeps measure
+                        // time since entering the state, not time since last heartbeat.
+                        (prev_status, prev_entered_at, prev_needs_reconcil)
+                    }
+                    Some((prev_status, _, _)) => (prev_status, updated_at as i64, 0i64),
+                    None => (String::new(), updated_at as i64, 0i64),
+                };
 
                 conn.execute(
-                    "INSERT OR REPLACE INTO settlement_status (message_id, status, updated_at)
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![id, status_str, updated_at as i64],
+                    "INSERT OR REPLACE INTO settlement_status
+                        (message_id, status, updated_at, status_entered_at, needs_reconciliation)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        status_str,
+                        updated_at as i64,
+                        status_entered_at,
+                        next_needs_reconciliation
+                    ],
                 )?;
 
                 conn.execute(
@@ -735,10 +779,10 @@ impl SyncEngineDb {
                     rusqlite::params![id, from_status, status_str, updated_at as i64],
                 )?;
 
-                Ok(())
+                Ok(Ok(()))
             })
             .await?;
-        Ok(())
+        outcome
     }
 
     /// Update settlement statuses in bulk inside a single database transaction.
@@ -763,21 +807,31 @@ impl SyncEngineDb {
                 for (message_id, to_status, updated_at) in updates {
                     let id = message_id.to_vec();
 
-                    let from_status_res: rusqlite::Result<String> = tx
-                        .query_row(
-                            "SELECT status FROM settlement_status WHERE message_id = ?1",
-                            rusqlite::params![id],
-                            |row| row.get(0),
-                        );
+                    let from_status_res: rusqlite::Result<(String, i64)> = tx.query_row(
+                        "SELECT status, needs_reconciliation FROM settlement_status WHERE message_id = ?1",
+                        rusqlite::params![id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    );
 
-                    let from_status_str = match from_status_res {
-                        Ok(s) => s,
+                    let (from_status_str, needs_reconciliation) = match from_status_res {
+                        Ok(pair) => pair,
                         Err(rusqlite::Error::QueryReturnedNoRows) => {
                             rejected.push((message_id, "Untracked envelope".to_string()));
                             continue;
                         }
                         Err(e) => return Err(e.into()),
                     };
+
+                    if from_status_str == SettlementStatus::Failed.as_str()
+                        && needs_reconciliation != 0
+                        && to_status == SettlementStatus::Propagating
+                    {
+                        rejected.push((
+                            message_id,
+                            "Stuck envelope requires on-chain non-settlement confirmation before re-propagating".to_string(),
+                        ));
+                        continue;
+                    }
 
                     let is_valid = match from_status_str.parse::<SettlementStatus>() {
                         Ok(current_status) => current_status.can_transition_to(to_status),
@@ -787,14 +841,20 @@ impl SyncEngineDb {
                     if !is_valid {
                         rejected.push((
                             message_id,
-                            format!("Illegal transition from '{}' to '{}'", from_status_str, to_status.as_str()),
+                            format!(
+                                "Illegal transition from '{}' to '{}'",
+                                from_status_str,
+                                to_status.as_str()
+                            ),
                         ));
                         continue;
                     }
 
                     let to_status_str = to_status.as_str().to_string();
                     tx.execute(
-                        "UPDATE settlement_status SET status = ?1, updated_at = ?2 WHERE message_id = ?3",
+                        "UPDATE settlement_status
+                         SET status = ?1, updated_at = ?2, status_entered_at = ?2, needs_reconciliation = 0
+                         WHERE message_id = ?3",
                         rusqlite::params![to_status_str, updated_at as i64, id],
                     )?;
 
@@ -813,6 +873,224 @@ impl SyncEngineDb {
             .await?;
 
         Ok(report)
+    }
+
+    /// Identify and transition envelopes stuck in [`SettlementStatus::Propagating`]
+    /// whose `status_entered_at` timestamp is older than `now.saturating_sub(timeout_secs)`.
+    ///
+    /// # Funds-Safety Recovery Model (Issue #18)
+    ///
+    /// An envelope stays in `Propagating` when the mesh never returned a settlement
+    /// confirmation. That silence is ambiguous:
+    /// 1. Every relay along the path dropped or failed to submit the envelope, so
+    ///    it never reached Stellar (safe to re-propagate).
+    /// 2. A relay submitted the envelope on-chain and it settled, but the return
+    ///    acknowledgment was lost in the mesh (unsafe to re-create or re-submit
+    ///    without checking on-chain state first).
+    ///
+    /// To prevent accidental duplicate payments or sequence collisions:
+    /// - `sweep_stuck_propagating` atomically moves timed-out `Propagating`
+    ///   envelopes to [`SettlementStatus::Failed`] with `needs_reconciliation = 1`
+    ///   and records a `propagating -> failed` entry in `settlement_history`.
+    /// - While `needs_reconciliation = 1`, [`Self::set_settlement_status`] and
+    ///   [`Self::set_settlement_status_batch`] refuse any direct `Failed -> Propagating`
+    ///   retry.
+    /// - The caller must first query the account's confirmed on-chain sequence
+    ///   number and invoke [`Self::confirm_non_settlement`]. Only when
+    ///   `confirmed_on_chain_sequence < envelope.sequence` (proving the sequence
+    ///   slot has not yet been consumed on-chain) is the reconciliation hold
+    ///   cleared and the envelope transitioned back to `Propagating`.
+    pub async fn sweep_stuck_propagating(
+        &self,
+        timeout_secs: u64,
+        now: u64,
+    ) -> Result<Vec<[u8; 32]>, SyncEngineError> {
+        let cutoff = now.saturating_sub(timeout_secs) as i64;
+        let now_i64 = now as i64;
+
+        let swept = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                let stuck_ids: Vec<Vec<u8>> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT message_id FROM settlement_status
+                         WHERE status = 'propagating' AND status_entered_at < ?1
+                         ORDER BY status_entered_at ASC, message_id ASC",
+                    )?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![cutoff], |row| row.get::<_, Vec<u8>>(0))?
+                        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                    rows
+                };
+
+                let mut result = Vec::with_capacity(stuck_ids.len());
+                for id_bytes in stuck_ids {
+                    tx.execute(
+                        "UPDATE settlement_status
+                         SET status = 'failed',
+                             updated_at = ?1,
+                             status_entered_at = ?1,
+                             needs_reconciliation = 1
+                         WHERE message_id = ?2",
+                        rusqlite::params![now_i64, id_bytes],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO settlement_history (message_id, from_status, to_status, timestamp)
+                         VALUES (?1, 'propagating', 'failed', ?2)",
+                        rusqlite::params![id_bytes, now_i64],
+                    )?;
+                    if let Ok(arr) = <[u8; 32]>::try_from(id_bytes.as_slice()) {
+                        result.push(arr);
+                    }
+                }
+
+                tx.commit()?;
+                Ok(result)
+            })
+            .await?;
+
+        Ok(swept)
+    }
+
+    /// Confirm via an authoritative on-chain sequence check that a stuck-swept
+    /// envelope has **not** settled on-chain (`confirmed_on_chain_sequence < envelope.sequence`),
+    /// clearing its reconciliation hold and transitioning it from `Failed` back
+    /// to [`SettlementStatus::Propagating`].
+    ///
+    /// If `confirmed_on_chain_sequence >= envelope.sequence`, the sequence slot
+    /// has already been consumed on-chain, so re-propagating is rejected with
+    /// [`SyncEngineError::InvalidStateTransition`] and the reconciliation hold
+    /// remains in place until the caller marks the envelope `Settled` or
+    /// resolves the sequence conflict.
+    pub async fn confirm_non_settlement(
+        &self,
+        message_id: [u8; 32],
+        confirmed_on_chain_sequence: i64,
+        now: u64,
+    ) -> Result<SettlementStatus, SyncEngineError> {
+        let id = message_id.to_vec();
+        let hex_id = hex::encode(message_id);
+        let now_i64 = now as i64;
+
+        let outcome: Result<SettlementStatus, SyncEngineError> = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+
+                let envelope_seq: i64 = match tx.query_row(
+                    "SELECT sequence FROM queued_envelopes WHERE message_id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                ) {
+                    Ok(seq) => seq,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        return Ok(Err(SyncEngineError::EnvelopeNotFound(hex_id)));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+
+                let status_str: String = match tx.query_row(
+                    "SELECT status FROM settlement_status WHERE message_id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                ) {
+                    Ok(s) => s,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        return Ok(Err(SyncEngineError::EnvelopeNotFound(hex_id)));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+
+                if status_str != SettlementStatus::Failed.as_str() {
+                    return Ok(Err(SyncEngineError::InvalidStateTransition {
+                        from: status_str,
+                        to: SettlementStatus::Propagating.as_str().to_string(),
+                    }));
+                }
+
+                if confirmed_on_chain_sequence >= envelope_seq {
+                    return Ok(Err(SyncEngineError::InvalidStateTransition {
+                        from: format!(
+                            "failed (on-chain sequence {} >= envelope sequence {}; non-settlement not confirmed)",
+                            confirmed_on_chain_sequence, envelope_seq
+                        ),
+                        to: SettlementStatus::Propagating.as_str().to_string(),
+                    }));
+                }
+
+                tx.execute(
+                    "UPDATE settlement_status
+                     SET status = 'propagating',
+                         updated_at = ?1,
+                         status_entered_at = ?1,
+                         needs_reconciliation = 0
+                     WHERE message_id = ?2",
+                    rusqlite::params![now_i64, id],
+                )?;
+
+                tx.execute(
+                    "INSERT INTO settlement_history (message_id, from_status, to_status, timestamp)
+                     VALUES (?1, 'failed', 'propagating', ?2)",
+                    rusqlite::params![id, now_i64],
+                )?;
+
+                tx.commit()?;
+                Ok(Ok(SettlementStatus::Propagating))
+            })
+            .await?;
+
+        outcome
+    }
+
+    /// Return whether `message_id` is currently held in post-timeout
+    /// reconciliation (`needs_reconciliation != 0`), blocking automatic
+    /// `Failed -> Propagating` re-submission until [`Self::confirm_non_settlement`]
+    /// verifies that its sequence number was not consumed on-chain.
+    pub async fn requires_reconciliation(
+        &self,
+        message_id: [u8; 32],
+    ) -> Result<bool, SyncEngineError> {
+        let id = message_id.to_vec();
+        let flag: Option<i64> = self
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT needs_reconciliation FROM settlement_status WHERE message_id = ?1",
+                )?;
+                let mut rows = stmt.query(rusqlite::params![id])?;
+                if let Some(row) = rows.next()? {
+                    Ok(Some(row.get::<_, i64>(0)?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await?;
+        Ok(flag.unwrap_or(0) != 0)
+    }
+
+    /// Return the Unix timestamp (seconds) at which `message_id` entered its
+    /// current [`SettlementStatus`], or `None` if untracked.
+    pub async fn get_status_entered_at(
+        &self,
+        message_id: [u8; 32],
+    ) -> Result<Option<u64>, SyncEngineError> {
+        let id = message_id.to_vec();
+        let entered_at: Option<i64> = self
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT status_entered_at FROM settlement_status WHERE message_id = ?1",
+                )?;
+                let mut rows = stmt.query(rusqlite::params![id])?;
+                if let Some(row) = rows.next()? {
+                    Ok(Some(row.get::<_, i64>(0)?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await?;
+        Ok(entered_at.map(|ts| ts as u64))
     }
 
     pub async fn get_settlement_status(
@@ -1336,14 +1614,18 @@ impl SyncEngineDb {
                     })?
                     .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
-                let mut stmt = conn
-                    .prepare("SELECT message_id, status, updated_at FROM settlement_status")?;
+                let mut stmt = conn.prepare(
+                    "SELECT message_id, status, updated_at, status_entered_at, needs_reconciliation
+                     FROM settlement_status",
+                )?;
                 let settlement_status = stmt
                     .query_map([], |row| {
                         Ok(SettlementStatusRow {
                             message_id: row.get(0)?,
                             status: row.get(1)?,
                             updated_at: row.get(2)?,
+                            status_entered_at: row.get(3)?,
+                            needs_reconciliation: row.get(4)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, rusqlite::Error>>()?;
@@ -1526,9 +1808,16 @@ impl SyncEngineDb {
 
                 for row in &snapshot.settlement_status {
                     tx.execute(
-                        "INSERT INTO settlement_status (message_id, status, updated_at)
-                         VALUES (?1, ?2, ?3)",
-                        rusqlite::params![row.message_id, row.status, row.updated_at],
+                        "INSERT INTO settlement_status
+                            (message_id, status, updated_at, status_entered_at, needs_reconciliation)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![
+                            row.message_id,
+                            row.status,
+                            row.updated_at,
+                            row.status_entered_at,
+                            row.needs_reconciliation
+                        ],
                     )?;
                 }
 
@@ -2446,6 +2735,151 @@ mod tests {
         assert!(
             result.is_err() || result.unwrap().is_none(),
             "Expected error or None when reading encrypted DB without key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sweep_identifies_stuck_propagating_envelopes() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let env_stuck = mock_envelope(51);
+        let env_queued = mock_envelope(52);
+        let env_settled = mock_envelope(53);
+
+        db.enqueue_transaction(&env_stuck, "GSTUCK", 101, TxPriority::Normal, 1_000)
+            .await
+            .unwrap();
+        db.enqueue_transaction(&env_queued, "GQUEUED", 201, TxPriority::Normal, 1_000)
+            .await
+            .unwrap();
+        db.enqueue_transaction(&env_settled, "GSETTLED", 301, TxPriority::Normal, 1_000)
+            .await
+            .unwrap();
+
+        // Enter Propagating at t = 1_100
+        db.set_settlement_status([51u8; 32], SettlementStatus::Propagating, 1_100)
+            .await
+            .unwrap();
+        // Touch `updated_at` at t = 1_950 without changing status — `status_entered_at`
+        // must remain 1_100 so the envelope is still recognized as stuck at t = 2_000.
+        db.set_settlement_status([51u8; 32], SettlementStatus::Propagating, 1_950)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_status_entered_at([51u8; 32]).await.unwrap(),
+            Some(1_100)
+        );
+
+        db.set_settlement_status([53u8; 32], SettlementStatus::Propagating, 1_100)
+            .await
+            .unwrap();
+        db.set_settlement_status([53u8; 32], SettlementStatus::Settled, 1_200)
+            .await
+            .unwrap();
+
+        let swept = db.sweep_stuck_propagating(600, 2_000).await.unwrap();
+        assert_eq!(swept, vec![[51u8; 32]]);
+        assert_eq!(
+            db.get_settlement_status([51u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Failed)
+        );
+        assert!(db.requires_reconciliation([51u8; 32]).await.unwrap());
+        assert_eq!(
+            db.get_settlement_status([52u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Queued)
+        );
+        assert_eq!(
+            db.get_settlement_status([53u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Settled)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sweep_ignores_recently_propagating_envelopes() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let env_recent = mock_envelope(61);
+        let env_boundary = mock_envelope(62);
+
+        db.enqueue_transaction(&env_recent, "GRECENT", 101, TxPriority::Normal, 1_000)
+            .await
+            .unwrap();
+        db.enqueue_transaction(&env_boundary, "GBOUND", 201, TxPriority::Normal, 1_000)
+            .await
+            .unwrap();
+
+        // Entered Propagating at 1_500 and 1_400; at now = 2_000 with timeout = 600,
+        // cutoff is 1_400 (`status_entered_at < 1_400`), so neither is stuck yet.
+        db.set_settlement_status([61u8; 32], SettlementStatus::Propagating, 1_500)
+            .await
+            .unwrap();
+        db.set_settlement_status([62u8; 32], SettlementStatus::Propagating, 1_400)
+            .await
+            .unwrap();
+
+        let swept = db.sweep_stuck_propagating(600, 2_000).await.unwrap();
+        assert!(swept.is_empty());
+        assert_eq!(
+            db.get_settlement_status([61u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Propagating)
+        );
+        assert_eq!(
+            db.get_settlement_status([62u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Propagating)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_path_does_not_auto_resubmit_without_confirmation_of_non_settlement() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let env = mock_envelope(71);
+
+        db.enqueue_transaction(&env, "GRECOVER", 105, TxPriority::Normal, 1_000)
+            .await
+            .unwrap();
+        db.set_settlement_status([71u8; 32], SettlementStatus::Propagating, 1_100)
+            .await
+            .unwrap();
+
+        let swept = db.sweep_stuck_propagating(300, 1_500).await.unwrap();
+        assert_eq!(swept, vec![[71u8; 32]]);
+        assert!(db.requires_reconciliation([71u8; 32]).await.unwrap());
+
+        // 1. Direct `Failed -> Propagating` retry without on-chain confirmation is rejected.
+        let direct_retry = db
+            .set_settlement_status([71u8; 32], SettlementStatus::Propagating, 1_510)
+            .await;
+        assert!(matches!(
+            direct_retry,
+            Err(SyncEngineError::InvalidStateTransition { .. })
+        ));
+
+        // 2. Batch `Failed -> Propagating` retry without on-chain confirmation is also rejected.
+        let batch_report = db
+            .set_settlement_status_batch(&[([71u8; 32], SettlementStatus::Propagating, 1_520)])
+            .await
+            .unwrap();
+        assert!(batch_report.applied.is_empty());
+        assert_eq!(batch_report.rejected.len(), 1);
+
+        // 3. If the on-chain sequence is already >= 105, non-settlement is NOT confirmed,
+        // so `confirm_non_settlement` refuses to re-propagate.
+        let already_consumed = db.confirm_non_settlement([71u8; 32], 105, 1_530).await;
+        assert!(matches!(
+            already_consumed,
+            Err(SyncEngineError::InvalidStateTransition { .. })
+        ));
+        assert!(db.requires_reconciliation([71u8; 32]).await.unwrap());
+
+        // 4. Once on-chain sequence is verified to be < 105 (e.g. 104), non-settlement is
+        // confirmed, clearing the hold and transitioning back to `Propagating`.
+        let recovered = db
+            .confirm_non_settlement([71u8; 32], 104, 1_540)
+            .await
+            .unwrap();
+        assert_eq!(recovered, SettlementStatus::Propagating);
+        assert!(!db.requires_reconciliation([71u8; 32]).await.unwrap());
+        assert_eq!(
+            db.get_settlement_status([71u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Propagating)
         );
     }
 }

@@ -1,7 +1,7 @@
 //! Settlement state machine for a queued envelope, from the moment it's
 //! signed offline to final on-chain confirmation (or failure).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use crate::errors::SyncEngineError;
@@ -72,9 +72,26 @@ impl FromStr for SettlementStatus {
 /// envelope. Durable persistence of status is handled separately by
 /// `crate::storage::db::SyncEngineDb` — callers that need both should update
 /// the tracker and the DB together.
+///
+/// # Stuck-propagation funds-safety gate (issue #18)
+///
+/// When an envelope stays in [`SettlementStatus::Propagating`] past the
+/// configured timeout and is swept to [`SettlementStatus::Failed`], the mesh
+/// may have delivered the transaction to a relay that submitted it on-chain
+/// while the confirmation was dropped on the return path. Blindly retrying
+/// `Failed -> Propagating` could re-broadcast or re-create a payment before
+/// the device has verified whether the original sequence number already
+/// settled on-chain.
+///
+/// Envelopes moved to `Failed` by [`Self::mark_stuck_failed`] are placed in an
+/// explicit reconciliation hold (`needs_reconciliation`). While that hold is
+/// active, [`Self::transition`] rejects `Failed -> Propagating` until the
+/// caller invokes [`Self::confirm_non_settlement_and_repropagate`] with a
+/// verified on-chain sequence strictly lower than the envelope's sequence.
 #[derive(Debug, Default)]
 pub struct SettlementTracker {
     statuses: HashMap<[u8; 32], SettlementStatus>,
+    needs_reconciliation: HashSet<[u8; 32]>,
 }
 
 impl SettlementTracker {
@@ -85,6 +102,7 @@ impl SettlementTracker {
     /// Register a newly-queued envelope. Fresh entries always start `Queued`.
     pub fn track(&mut self, message_id: [u8; 32]) {
         self.statuses.insert(message_id, SettlementStatus::Queued);
+        self.needs_reconciliation.remove(&message_id);
     }
 
     /// Restore an envelope directly to `status`, bypassing transition
@@ -94,14 +112,103 @@ impl SettlementTracker {
     /// transitions.
     pub fn restore(&mut self, message_id: [u8; 32], status: SettlementStatus) {
         self.statuses.insert(message_id, status);
+        if status != SettlementStatus::Failed {
+            self.needs_reconciliation.remove(&message_id);
+        }
+    }
+
+    /// Restore an envelope along with its reconciliation-hold flag.
+    pub fn restore_with_reconciliation(
+        &mut self,
+        message_id: [u8; 32],
+        status: SettlementStatus,
+        needs_reconciliation: bool,
+    ) {
+        self.statuses.insert(message_id, status);
+        if status == SettlementStatus::Failed && needs_reconciliation {
+            self.needs_reconciliation.insert(message_id);
+        } else {
+            self.needs_reconciliation.remove(&message_id);
+        }
     }
 
     pub fn status(&self, message_id: &[u8; 32]) -> Option<SettlementStatus> {
         self.statuses.get(message_id).copied()
     }
 
+    /// Whether `message_id` was swept out of `Propagating` due to a timeout
+    /// and still awaits on-chain non-settlement confirmation before it may be
+    /// re-propagated.
+    pub fn requires_reconciliation(&self, message_id: &[u8; 32]) -> bool {
+        self.needs_reconciliation.contains(message_id)
+    }
+
+    /// Mark an envelope that was stuck in `Propagating` as `Failed` with a
+    /// mandatory reconciliation hold blocking automatic `Failed -> Propagating`
+    /// retries until [`Self::confirm_non_settlement_and_repropagate`] succeeds.
+    pub fn mark_stuck_failed(&mut self, message_id: [u8; 32]) -> Result<(), SyncEngineError> {
+        let current = self
+            .statuses
+            .get(&message_id)
+            .copied()
+            .ok_or_else(|| SyncEngineError::EnvelopeNotFound(hex::encode(message_id)))?;
+
+        if current != SettlementStatus::Propagating {
+            return Err(SyncEngineError::InvalidStateTransition {
+                from: current.as_str().to_string(),
+                to: SettlementStatus::Failed.as_str().to_string(),
+            });
+        }
+
+        self.statuses.insert(message_id, SettlementStatus::Failed);
+        self.needs_reconciliation.insert(message_id);
+        Ok(())
+    }
+
+    /// Release the stuck-propagation reconciliation hold and transition the
+    /// envelope from `Failed` back to `Propagating` only if the account's
+    /// confirmed on-chain sequence number is strictly less than the envelope's
+    /// sequence number (`confirmed_on_chain_sequence < envelope_sequence`),
+    /// proving that the envelope has not yet settled on-chain.
+    pub fn confirm_non_settlement_and_repropagate(
+        &mut self,
+        message_id: [u8; 32],
+        envelope_sequence: i64,
+        confirmed_on_chain_sequence: i64,
+    ) -> Result<(), SyncEngineError> {
+        let current = self
+            .statuses
+            .get(&message_id)
+            .copied()
+            .ok_or_else(|| SyncEngineError::EnvelopeNotFound(hex::encode(message_id)))?;
+
+        if current != SettlementStatus::Failed {
+            return Err(SyncEngineError::InvalidStateTransition {
+                from: current.as_str().to_string(),
+                to: SettlementStatus::Propagating.as_str().to_string(),
+            });
+        }
+
+        if confirmed_on_chain_sequence >= envelope_sequence {
+            return Err(SyncEngineError::InvalidStateTransition {
+                from: format!(
+                    "failed (on-chain sequence {} >= envelope sequence {}; non-settlement not confirmed)",
+                    confirmed_on_chain_sequence, envelope_sequence
+                ),
+                to: SettlementStatus::Propagating.as_str().to_string(),
+            });
+        }
+
+        self.needs_reconciliation.remove(&message_id);
+        self.statuses
+            .insert(message_id, SettlementStatus::Propagating);
+        Ok(())
+    }
+
     /// Attempt to move `message_id` to `next`. Fails if no such envelope is
-    /// tracked, or if the transition is not legal from its current status.
+    /// tracked, if the transition is not legal from its current status, or if
+    /// the envelope was swept from `Propagating` as stuck and has not yet
+    /// confirmed non-settlement on-chain.
     pub fn transition(
         &mut self,
         message_id: [u8; 32],
@@ -120,7 +227,20 @@ impl SettlementTracker {
             });
         }
 
+        if current == SettlementStatus::Failed
+            && next == SettlementStatus::Propagating
+            && self.needs_reconciliation.contains(&message_id)
+        {
+            return Err(SyncEngineError::InvalidStateTransition {
+                from: "failed (awaiting on-chain non-settlement confirmation)".to_string(),
+                to: next.as_str().to_string(),
+            });
+        }
+
         self.statuses.insert(message_id, next);
+        if next != SettlementStatus::Failed {
+            self.needs_reconciliation.remove(&message_id);
+        }
         Ok(())
     }
 
@@ -254,5 +374,38 @@ mod tests {
             let parsed: SettlementStatus = status.as_str().parse().unwrap();
             assert_eq!(parsed, status);
         }
+    }
+
+    #[test]
+    fn test_stuck_failed_requires_non_settlement_confirmation_before_retry() {
+        let mut tracker = SettlementTracker::new();
+        let id = [8u8; 32];
+        tracker.track(id);
+        tracker
+            .transition(id, SettlementStatus::Propagating)
+            .unwrap();
+        tracker.mark_stuck_failed(id).unwrap();
+        assert_eq!(tracker.status(&id), Some(SettlementStatus::Failed));
+        assert!(tracker.requires_reconciliation(&id));
+
+        // Direct retry is blocked while awaiting reconciliation.
+        assert!(matches!(
+            tracker.transition(id, SettlementStatus::Propagating),
+            Err(SyncEngineError::InvalidStateTransition { .. })
+        ));
+
+        // On-chain sequence >= envelope sequence is also blocked.
+        assert!(matches!(
+            tracker.confirm_non_settlement_and_repropagate(id, 100, 100),
+            Err(SyncEngineError::InvalidStateTransition { .. })
+        ));
+        assert!(tracker.requires_reconciliation(&id));
+
+        // Confirmed non-settlement (on-chain sequence < envelope sequence) releases hold.
+        tracker
+            .confirm_non_settlement_and_repropagate(id, 100, 99)
+            .unwrap();
+        assert!(!tracker.requires_reconciliation(&id));
+        assert_eq!(tracker.status(&id), Some(SettlementStatus::Propagating));
     }
 }
