@@ -236,18 +236,6 @@ struct DbSnapshot {
     dispute_escalations: Vec<DisputeEscalationRow>,
 }
 
-/// Result of attempting the transactional half of an import: whether the
-/// database turned out to be non-empty is decided *inside* the same
-/// transaction that would otherwise perform the insert, so there is no
-/// window between a separate "is it empty?" check and the insert itself in
-/// which a concurrent writer could sneak in a row (this matters because
-/// `SyncEngineDb` is designed to be shared behind an `Arc` across
-/// concurrent callers — see `test_escalation_survives_conflicting_concurrent_writes`).
-enum ImportOutcome {
-    Imported(ImportReport),
-    TargetNotEmpty,
-}
-
 impl SyncEngineDb {
     /// Initialize the embedded SQLite database, creating tables if needed.
     /// Pass `":memory:"` for an ephemeral, test-only database.
@@ -488,6 +476,107 @@ impl SyncEngineDb {
         }
     }
 
+    /// Execute a multi-statement closure atomically inside a single SQLite
+    /// transaction on the `tokio-rusqlite` connection actor (issue #14).
+    ///
+    /// If `f` returns `Ok(val)`, the transaction is committed before returning
+    /// `Ok(val)`. If `f` returns `Err(e)` (or panics), the `rusqlite::Transaction`
+    /// is dropped without committing, rolling back every statement executed
+    /// inside `f` so no partial effects remain visible.
+    pub async fn transaction<F, T>(&self, f: F) -> Result<T, SyncEngineError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, SyncEngineError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let outcome = self
+            .conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                match f(&tx) {
+                    Ok(value) => {
+                        tx.commit()?;
+                        Ok(Ok(value))
+                    }
+                    Err(err) => {
+                        drop(tx);
+                        Ok(Err(err))
+                    }
+                }
+            })
+            .await?;
+        outcome
+    }
+
+    /// Synchronous helper for recording a sequence reservation inside an
+    /// active [`Self::transaction`].
+    pub fn save_sequence_reservation_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        source_account: &str,
+        last_reserved: i64,
+    ) -> Result<(), SyncEngineError> {
+        tx.execute(
+            "INSERT OR REPLACE INTO sequence_reservations (source_account, last_reserved)
+             VALUES (?1, ?2)",
+            rusqlite::params![source_account, last_reserved],
+        )?;
+        Ok(())
+    }
+
+    /// Synchronous helper for updating an envelope's settlement status and
+    /// appending its `settlement_history` audit entry inside an active
+    /// [`Self::transaction`].
+    pub fn set_settlement_status_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        message_id: [u8; 32],
+        status: SettlementStatus,
+        updated_at: u64,
+    ) -> Result<(), SyncEngineError> {
+        let id = message_id.to_vec();
+        let status_str = status.as_str();
+        let from_status: String = tx
+            .query_row(
+                "SELECT status FROM settlement_status WHERE message_id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+
+        tx.execute(
+            "INSERT OR REPLACE INTO settlement_status (message_id, status, updated_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, status_str, updated_at as i64],
+        )?;
+
+        tx.execute(
+            "INSERT INTO settlement_history (message_id, from_status, to_status, timestamp)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id, from_status, status_str, updated_at as i64],
+        )?;
+
+        Ok(())
+    }
+
+    /// Synchronous helper for recording a conflict inside an active
+    /// [`Self::transaction`].
+    pub fn record_conflict_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        conflict: &Conflict,
+        detected_at: u64,
+    ) -> Result<(), SyncEngineError> {
+        tx.execute(
+            "INSERT INTO conflicts (source_account, sequence, envelope_a, envelope_b, detected_at, resolved)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            rusqlite::params![
+                conflict.source_account,
+                conflict.sequence,
+                conflict.envelope_a.to_vec(),
+                conflict.envelope_b.to_vec(),
+                detected_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
     pub async fn enqueue_envelope(
         &self,
         envelope: &TransactionEnvelope,
@@ -561,37 +650,29 @@ impl SyncEngineDb {
         let priority: i64 = priority.into();
         let status = SettlementStatus::Queued.as_str().to_string();
 
-        self.conn
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO sequence_reservations
-                        (source_account, last_reserved) VALUES (?1, ?2)",
-                    rusqlite::params![source_account, sequence],
-                )?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO queued_envelopes
-                        (message_id, source_account, sequence, priority, enqueued_at, envelope_bytes)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        message_id,
-                        source_account,
-                        sequence,
-                        priority,
-                        enqueued_at as i64,
-                        envelope_bytes
-                    ],
-                )?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO settlement_status (message_id, status, updated_at)
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![message_id, status, enqueued_at as i64],
-                )?;
-                tx.commit()?;
-                Ok(())
-            })
-            .await?;
-        Ok(())
+        self.transaction(move |tx| {
+            Self::save_sequence_reservation_in_tx(tx, &source_account, sequence)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO queued_envelopes
+                    (message_id, source_account, sequence, priority, enqueued_at, envelope_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    message_id,
+                    source_account,
+                    sequence,
+                    priority,
+                    enqueued_at as i64,
+                    envelope_bytes
+                ],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO settlement_status (message_id, status, updated_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![message_id, status, enqueued_at as i64],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn get_queued_envelope(
@@ -711,34 +792,10 @@ impl SyncEngineDb {
         status: SettlementStatus,
         updated_at: u64,
     ) -> Result<(), SyncEngineError> {
-        let id = message_id.to_vec();
-        let status_str = status.as_str().to_string();
-        self.conn
-            .call(move |conn| {
-                let from_status: String = conn
-                    .query_row(
-                        "SELECT status FROM settlement_status WHERE message_id = ?1",
-                        rusqlite::params![id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or_default();
-
-                conn.execute(
-                    "INSERT OR REPLACE INTO settlement_status (message_id, status, updated_at)
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![id, status_str, updated_at as i64],
-                )?;
-
-                conn.execute(
-                    "INSERT INTO settlement_history (message_id, from_status, to_status, timestamp)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![id, from_status, status_str, updated_at as i64],
-                )?;
-
-                Ok(())
-            })
-            .await?;
-        Ok(())
+        self.transaction(move |tx| {
+            Self::set_settlement_status_in_tx(tx, message_id, status, updated_at)
+        })
+        .await
     }
 
     /// Update settlement statuses in bulk inside a single database transaction.
@@ -753,66 +810,63 @@ impl SyncEngineDb {
     ) -> Result<BatchUpdateReport, SyncEngineError> {
         let updates = updates.to_vec();
 
-        let report = self
-            .conn
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                let mut applied = Vec::new();
-                let mut rejected = Vec::new();
+        self.transaction(move |tx| {
+            let mut applied = Vec::new();
+            let mut rejected = Vec::new();
 
-                for (message_id, to_status, updated_at) in updates {
-                    let id = message_id.to_vec();
+            for (message_id, to_status, updated_at) in updates {
+                let id = message_id.to_vec();
 
-                    let from_status_res: rusqlite::Result<String> = tx
-                        .query_row(
-                            "SELECT status FROM settlement_status WHERE message_id = ?1",
-                            rusqlite::params![id],
-                            |row| row.get(0),
-                        );
+                let from_status_res: rusqlite::Result<String> = tx.query_row(
+                    "SELECT status FROM settlement_status WHERE message_id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                );
 
-                    let from_status_str = match from_status_res {
-                        Ok(s) => s,
-                        Err(rusqlite::Error::QueryReturnedNoRows) => {
-                            rejected.push((message_id, "Untracked envelope".to_string()));
-                            continue;
-                        }
-                        Err(e) => return Err(e.into()),
-                    };
-
-                    let is_valid = match from_status_str.parse::<SettlementStatus>() {
-                        Ok(current_status) => current_status.can_transition_to(to_status),
-                        Err(_) => false,
-                    };
-
-                    if !is_valid {
-                        rejected.push((
-                            message_id,
-                            format!("Illegal transition from '{}' to '{}'", from_status_str, to_status.as_str()),
-                        ));
+                let from_status_str = match from_status_res {
+                    Ok(s) => s,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        rejected.push((message_id, "Untracked envelope".to_string()));
                         continue;
                     }
+                    Err(e) => return Err(e.into()),
+                };
 
-                    let to_status_str = to_status.as_str().to_string();
-                    tx.execute(
-                        "UPDATE settlement_status SET status = ?1, updated_at = ?2 WHERE message_id = ?3",
-                        rusqlite::params![to_status_str, updated_at as i64, id],
-                    )?;
+                let is_valid = match from_status_str.parse::<SettlementStatus>() {
+                    Ok(current_status) => current_status.can_transition_to(to_status),
+                    Err(_) => false,
+                };
 
-                    tx.execute(
-                        "INSERT INTO settlement_history (message_id, from_status, to_status, timestamp)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        rusqlite::params![id, from_status_str, to_status_str, updated_at as i64],
-                    )?;
-
-                    applied.push(message_id);
+                if !is_valid {
+                    rejected.push((
+                        message_id,
+                        format!(
+                            "Illegal transition from '{}' to '{}'",
+                            from_status_str,
+                            to_status.as_str()
+                        ),
+                    ));
+                    continue;
                 }
 
-                tx.commit()?;
-                Ok(BatchUpdateReport { applied, rejected })
-            })
-            .await?;
+                let to_status_str = to_status.as_str().to_string();
+                tx.execute(
+                    "UPDATE settlement_status SET status = ?1, updated_at = ?2 WHERE message_id = ?3",
+                    rusqlite::params![to_status_str, updated_at as i64, id],
+                )?;
 
-        Ok(report)
+                tx.execute(
+                    "INSERT INTO settlement_history (message_id, from_status, to_status, timestamp)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![id, from_status_str, to_status_str, updated_at as i64],
+                )?;
+
+                applied.push(message_id);
+            }
+
+            Ok(BatchUpdateReport { applied, rejected })
+        })
+        .await
     }
 
     pub async fn get_settlement_status(
@@ -1115,35 +1169,32 @@ impl SyncEngineDb {
         let tx_id = escalation.tx_id.to_vec();
         let proof_bytes = rmp_serde::to_vec(&escalation.proof)?;
 
-        let id = self
-            .conn
-            .call(move |conn| {
-                conn.execute(
-                    "INSERT INTO dispute_escalations
-                        (source_account, sequence, envelope_a, envelope_b, initiator, respondent, tx_id, proof_bytes, created_at, submitted)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
-                    rusqlite::params![
-                        source_account,
-                        sequence,
-                        envelope_a,
-                        envelope_b,
-                        initiator,
-                        respondent,
-                        tx_id,
-                        proof_bytes,
-                        created_at as i64
-                    ],
-                )?;
-                Ok(conn.last_insert_rowid())
-            })
-            .await?;
+        let env_a_arr = conflict.envelope_a;
+        let env_b_arr = conflict.envelope_b;
 
-        self.set_settlement_status(conflict.envelope_a, SettlementStatus::Disputed, created_at)
-            .await?;
-        self.set_settlement_status(conflict.envelope_b, SettlementStatus::Disputed, created_at)
-            .await?;
-
-        Ok(id)
+        self.transaction(move |tx| {
+            tx.execute(
+                "INSERT INTO dispute_escalations
+                    (source_account, sequence, envelope_a, envelope_b, initiator, respondent, tx_id, proof_bytes, created_at, submitted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+                rusqlite::params![
+                    source_account,
+                    sequence,
+                    envelope_a,
+                    envelope_b,
+                    initiator,
+                    respondent,
+                    tx_id,
+                    proof_bytes,
+                    created_at as i64
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            Self::set_settlement_status_in_tx(tx, env_a_arr, SettlementStatus::Disputed, created_at)?;
+            Self::set_settlement_status_in_tx(tx, env_b_arr, SettlementStatus::Disputed, created_at)?;
+            Ok(id)
+        })
+        .await
     }
 
     /// List every escalation not yet marked submitted (`submitted = 0`) —
@@ -1487,130 +1538,119 @@ impl SyncEngineDb {
             });
         }
 
-        let outcome = self
-            .conn
-            .call(move |conn| {
-                let tx = conn.transaction()?;
+        self.transaction(move |tx| {
+            let existing_rows: i64 = tx.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM queued_envelopes) +
+                    (SELECT COUNT(*) FROM settlement_status) +
+                    (SELECT COUNT(*) FROM sequence_reservations) +
+                    (SELECT COUNT(*) FROM conflicts) +
+                    (SELECT COUNT(*) FROM settlement_history) +
+                    (SELECT COUNT(*) FROM dispute_escalations)",
+                [],
+                |row| row.get(0),
+            )?;
 
-                let existing_rows: i64 = tx.query_row(
-                    "SELECT
-                        (SELECT COUNT(*) FROM queued_envelopes) +
-                        (SELECT COUNT(*) FROM settlement_status) +
-                        (SELECT COUNT(*) FROM sequence_reservations) +
-                        (SELECT COUNT(*) FROM conflicts) +
-                        (SELECT COUNT(*) FROM settlement_history) +
-                        (SELECT COUNT(*) FROM dispute_escalations)",
-                    [],
-                    |row| row.get(0),
+            if existing_rows != 0 {
+                return Err(SyncEngineError::ImportTargetNotEmpty);
+            }
+
+            for row in &snapshot.queued_envelopes {
+                tx.execute(
+                    "INSERT INTO queued_envelopes
+                        (message_id, source_account, sequence, priority, enqueued_at, envelope_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        row.message_id,
+                        row.source_account,
+                        row.sequence,
+                        row.priority,
+                        row.enqueued_at,
+                        row.envelope_bytes
+                    ],
                 )?;
+            }
 
-                if existing_rows != 0 {
-                    return Ok(ImportOutcome::TargetNotEmpty);
-                }
+            for row in &snapshot.settlement_status {
+                tx.execute(
+                    "INSERT INTO settlement_status (message_id, status, updated_at)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![row.message_id, row.status, row.updated_at],
+                )?;
+            }
 
-                for row in &snapshot.queued_envelopes {
-                    tx.execute(
-                        "INSERT INTO queued_envelopes
-                            (message_id, source_account, sequence, priority, enqueued_at, envelope_bytes)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        rusqlite::params![
-                            row.message_id,
-                            row.source_account,
-                            row.sequence,
-                            row.priority,
-                            row.enqueued_at,
-                            row.envelope_bytes
-                        ],
-                    )?;
-                }
+            for row in &snapshot.sequence_reservations {
+                tx.execute(
+                    "INSERT INTO sequence_reservations (source_account, last_reserved)
+                     VALUES (?1, ?2)",
+                    rusqlite::params![row.source_account, row.last_reserved],
+                )?;
+            }
 
-                for row in &snapshot.settlement_status {
-                    tx.execute(
-                        "INSERT INTO settlement_status (message_id, status, updated_at)
-                         VALUES (?1, ?2, ?3)",
-                        rusqlite::params![row.message_id, row.status, row.updated_at],
-                    )?;
-                }
+            for row in &snapshot.conflicts {
+                tx.execute(
+                    "INSERT INTO conflicts
+                        (id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        row.id,
+                        row.source_account,
+                        row.sequence,
+                        row.envelope_a,
+                        row.envelope_b,
+                        row.detected_at,
+                        row.resolved
+                    ],
+                )?;
+            }
 
-                for row in &snapshot.sequence_reservations {
-                    tx.execute(
-                        "INSERT INTO sequence_reservations (source_account, last_reserved)
-                         VALUES (?1, ?2)",
-                        rusqlite::params![row.source_account, row.last_reserved],
-                    )?;
-                }
+            for row in &snapshot.settlement_history {
+                tx.execute(
+                    "INSERT INTO settlement_history
+                        (id, message_id, from_status, to_status, timestamp)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        row.id,
+                        row.message_id,
+                        row.from_status,
+                        row.to_status,
+                        row.timestamp
+                    ],
+                )?;
+            }
 
-                for row in &snapshot.conflicts {
-                    tx.execute(
-                        "INSERT INTO conflicts
-                            (id, source_account, sequence, envelope_a, envelope_b, detected_at, resolved)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        rusqlite::params![
-                            row.id,
-                            row.source_account,
-                            row.sequence,
-                            row.envelope_a,
-                            row.envelope_b,
-                            row.detected_at,
-                            row.resolved
-                        ],
-                    )?;
-                }
+            for row in &snapshot.dispute_escalations {
+                tx.execute(
+                    "INSERT INTO dispute_escalations
+                        (id, source_account, sequence, envelope_a, envelope_b, initiator,
+                         respondent, tx_id, proof_bytes, created_at, submitted)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    rusqlite::params![
+                        row.id,
+                        row.source_account,
+                        row.sequence,
+                        row.envelope_a,
+                        row.envelope_b,
+                        row.initiator,
+                        row.respondent,
+                        row.tx_id,
+                        row.proof_bytes,
+                        row.created_at,
+                        row.submitted
+                    ],
+                )?;
+            }
 
-                for row in &snapshot.settlement_history {
-                    tx.execute(
-                        "INSERT INTO settlement_history
-                            (id, message_id, from_status, to_status, timestamp)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        rusqlite::params![
-                            row.id,
-                            row.message_id,
-                            row.from_status,
-                            row.to_status,
-                            row.timestamp
-                        ],
-                    )?;
-                }
-
-                for row in &snapshot.dispute_escalations {
-                    tx.execute(
-                        "INSERT INTO dispute_escalations
-                            (id, source_account, sequence, envelope_a, envelope_b, initiator,
-                             respondent, tx_id, proof_bytes, created_at, submitted)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                        rusqlite::params![
-                            row.id,
-                            row.source_account,
-                            row.sequence,
-                            row.envelope_a,
-                            row.envelope_b,
-                            row.initiator,
-                            row.respondent,
-                            row.tx_id,
-                            row.proof_bytes,
-                            row.created_at,
-                            row.submitted
-                        ],
-                    )?;
-                }
-
-                tx.commit()?;
-
-                Ok(ImportOutcome::Imported(ImportReport {
-                    queued_envelopes_imported: snapshot.queued_envelopes.len(),
-                    settlement_status_imported: snapshot.settlement_status.len(),
-                    sequence_reservations_imported: snapshot.sequence_reservations.len(),
-                    conflicts_imported: snapshot.conflicts.len(),
-                    settlement_history_imported: snapshot.settlement_history.len(),
-                    dispute_escalations_imported: snapshot.dispute_escalations.len(),
-                }))
+            Ok(ImportReport {
+                queued_envelopes_imported: snapshot.queued_envelopes.len(),
+                settlement_status_imported: snapshot.settlement_status.len(),
+                sequence_reservations_imported: snapshot.sequence_reservations.len(),
+                conflicts_imported: snapshot.conflicts.len(),
+                settlement_history_imported: snapshot.settlement_history.len(),
+                dispute_escalations_imported: snapshot.dispute_escalations.len(),
             })
-            .await?;
-
-        match outcome {
-            ImportOutcome::Imported(report) => Ok(report),
-            ImportOutcome::TargetNotEmpty => Err(SyncEngineError::ImportTargetNotEmpty),
-        }
+        })
+        .await
     }
 }
 
@@ -2446,6 +2486,171 @@ mod tests {
         assert!(
             result.is_err() || result.unwrap().is_none(),
             "Expected error or None when reading encrypted DB without key"
+        );
+    }
+
+    // ── Issue 14: multi-table atomic transaction tests ────────────────────────
+
+    #[tokio::test]
+    async fn test_transaction_commits_all_or_nothing_on_success() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let envelope = mock_envelope(77);
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let conflict = Conflict {
+            source_account: "GATOMIC".to_string(),
+            sequence: 500,
+            envelope_a: [77u8; 32],
+            envelope_b: [78u8; 32],
+        };
+        let conflict_clone = conflict.clone();
+
+        db.transaction(move |tx| {
+            SyncEngineDb::save_sequence_reservation_in_tx(tx, "GATOMIC", 500)?;
+            tx.execute(
+                "INSERT INTO queued_envelopes
+                    (message_id, source_account, sequence, priority, enqueued_at, envelope_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    envelope.message_id.to_vec(),
+                    "GATOMIC",
+                    500i64,
+                    i64::from(TxPriority::Emergency),
+                    1_234i64,
+                    envelope_bytes,
+                ],
+            )?;
+            SyncEngineDb::set_settlement_status_in_tx(
+                tx,
+                [77u8; 32],
+                SettlementStatus::Queued,
+                1_234,
+            )?;
+            SyncEngineDb::record_conflict_in_tx(tx, &conflict_clone, 1_234)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.load_sequence_reservation("GATOMIC").await.unwrap(),
+            Some(500)
+        );
+        let queued = db.get_queued_envelope([77u8; 32]).await.unwrap().unwrap();
+        assert_eq!(queued.source_account, "GATOMIC");
+        assert_eq!(queued.sequence, 500);
+        assert_eq!(
+            db.get_settlement_status([77u8; 32]).await.unwrap(),
+            Some(SettlementStatus::Queued)
+        );
+        assert_eq!(db.history_for([77u8; 32]).await.unwrap().len(), 1);
+        assert_eq!(
+            db.list_unresolved_conflicts().await.unwrap(),
+            vec![conflict]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transaction_rolls_back_all_on_failure() {
+        let db = SyncEngineDb::init(":memory:").await.unwrap();
+        let envelope = mock_envelope(88);
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+
+        // First statement succeeds (inserts sequence reservation and queued_envelopes),
+        // third statement fails with a UNIQUE constraint violation on settlement_status.
+        let result: Result<(), SyncEngineError> = db
+            .transaction(move |tx| {
+                SyncEngineDb::save_sequence_reservation_in_tx(tx, "GROLLBACK", 900)?;
+                tx.execute(
+                    "INSERT INTO queued_envelopes
+                        (message_id, source_account, sequence, priority, enqueued_at, envelope_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        envelope.message_id.to_vec(),
+                        "GROLLBACK",
+                        900i64,
+                        i64::from(TxPriority::Normal),
+                        2_000i64,
+                        envelope_bytes,
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO settlement_status (message_id, status, updated_at)
+                     VALUES (?1, 'queued', 2000)",
+                    rusqlite::params![envelope.message_id.to_vec()],
+                )?;
+                // Intentional PRIMARY KEY violation on the same message_id without OR REPLACE:
+                tx.execute(
+                    "INSERT INTO settlement_status (message_id, status, updated_at)
+                     VALUES (?1, 'propagating', 2001)",
+                    rusqlite::params![envelope.message_id.to_vec()],
+                )?;
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(SyncEngineError::SqliteError(_))),
+            "expected SqliteError from constraint violation, got {result:?}"
+        );
+
+        // Every prior write inside the failed transaction must be rolled back.
+        assert_eq!(
+            db.load_sequence_reservation("GROLLBACK").await.unwrap(),
+            None
+        );
+        assert!(db.get_queued_envelope([88u8; 32]).await.unwrap().is_none());
+        assert_eq!(db.get_settlement_status([88u8; 32]).await.unwrap(), None);
+        assert_eq!(db.summary().await.unwrap(), DbSummary::default());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_transactions_do_not_corrupt_state() {
+        let db = std::sync::Arc::new(SyncEngineDb::init(":memory:").await.unwrap());
+        let mut handles = Vec::new();
+
+        for i in 0u8..16u8 {
+            let db_clone = db.clone();
+            handles.push(tokio::spawn(async move {
+                let account = format!("GCONC_{i}");
+                let seq = i64::from(i) + 1;
+                let mut msg_id = [0u8; 32];
+                msg_id[0] = i;
+                let mut env = mock_envelope(i);
+                env.message_id = msg_id;
+
+                db_clone
+                    .enqueue_transaction(
+                        &env,
+                        &account,
+                        seq,
+                        TxPriority::Normal,
+                        5_000 + u64::from(i),
+                    )
+                    .await
+                    .unwrap();
+
+                // Also run a failing transaction concurrently to ensure rollbacks
+                // interleave cleanly with commits.
+                let _: Result<(), SyncEngineError> = db_clone
+                    .transaction(move |tx| {
+                        SyncEngineDb::save_sequence_reservation_in_tx(tx, "GFAIL_TEMP", 999)?;
+                        Err(SyncEngineError::InvalidEnvelope("simulated failure".into()))
+                    })
+                    .await;
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let summary = db.summary().await.unwrap();
+        assert_eq!(summary.queued_envelopes_count, 16);
+        assert_eq!(summary.settlement_status_count, 16);
+        assert_eq!(summary.sequence_reservations_count, 16);
+        assert_eq!(
+            db.load_sequence_reservation("GFAIL_TEMP").await.unwrap(),
+            None
         );
     }
 }
